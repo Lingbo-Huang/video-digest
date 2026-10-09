@@ -29,6 +29,21 @@ const BILIBILI_METADATA_TIMEOUT_MS = 15_000;
 const debugLog = (...args) => {
   if (DEBUG) console.log(...args);
 };
+const translationAbortControllers = new Map();
+
+function canceledAiRequest() {
+  const error = new Error("Translation request canceled");
+  error.code = "AI_CANCELED";
+  return error;
+}
+
+function cancelTranslationRequest(requestId) {
+  const controller = translationAbortControllers.get(requestId);
+  if (!controller) return false;
+  controller.abort();
+  translationAbortControllers.delete(requestId);
+  return true;
+}
 
 // Prevent the YouTube content script from reading the local bridge capability
 // token or cached data.
@@ -87,6 +102,7 @@ async function requestAiCompletion({
   maxTokens,
   temperature,
   responseFormat,
+  signal,
 }) {
   const settings = await getSettings();
   const bridge = globalThis.YTD_LOCAL_BRIDGE;
@@ -108,7 +124,11 @@ async function requestAiCompletion({
     () => controller.abort(),
     AI_PROVIDER_HARD_TIMEOUT_MS,
   );
+  const abortFromCaller = () => controller.abort();
+  signal?.addEventListener("abort", abortFromCaller, { once: true });
+  if (signal?.aborted) controller.abort();
   try {
+    if (signal?.aborted) throw canceledAiRequest();
     const response = await fetch(`${bridge.baseUrl}/v1/complete`, {
       method: "POST",
       headers: {
@@ -119,6 +139,7 @@ async function requestAiCompletion({
       signal: controller.signal,
     });
     const responseText = await response.text();
+    if (signal?.aborted) throw canceledAiRequest();
     if (new TextEncoder().encode(responseText).byteLength > AI_PROVIDER_MAX_RESPONSE_BYTES) {
       const error = new Error("Local AI response exceeded the 2 MiB limit.");
       error.code = "AI_RESPONSE_TOO_LARGE";
@@ -144,6 +165,7 @@ async function requestAiCompletion({
     return { text, settings };
   } catch (error) {
     if (error?.name === "AbortError") {
+      if (signal?.aborted) throw canceledAiRequest();
       const timeoutError = new Error(
         "Local AI request exceeded the 185-second limit. Please Retry.",
       );
@@ -153,6 +175,7 @@ async function requestAiCompletion({
     throw error;
   } finally {
     clearTimeout(hardTimeoutId);
+    signal?.removeEventListener("abort", abortFromCaller);
   }
 }
 
@@ -431,10 +454,16 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
       message.contentType,
       message.targetLanguage,
       message.videoTitle,
+      message.requestId,
     )
       .then(sendResponse)
       .catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
+  }
+
+  if (message.action === "cancelTranslation") {
+    sendResponse({ success: true, canceled: cancelTranslationRequest(message.requestId) });
+    return false;
   }
 
   if (message.action === "checkConfig") {
@@ -2437,7 +2466,18 @@ async function handleTranslateContent(
   contentType,
   targetLanguage,
   videoTitle,
+  requestId,
 ) {
+  const controller = typeof requestId === "string" &&
+    /^[0-9a-f-]{36}$/.test(requestId)
+    ? new AbortController()
+    : null;
+  if (controller) {
+    if (translationAbortControllers.has(requestId)) {
+      return { success: false, error: "Duplicate translation request ID" };
+    }
+    translationAbortControllers.set(requestId, controller);
+  }
   try {
     if (targetLanguage !== "zh") {
       return {
@@ -2469,6 +2509,7 @@ async function handleTranslateContent(
       temperature: 0.2,
       maxTokens: 1536,
       responseFormat: { type: "json_object" },
+      signal: controller?.signal,
     };
     let result = await callAiTranslation(
       systemPrompt,
@@ -2482,6 +2523,7 @@ async function handleTranslateContent(
       result = await callAiTranslation(systemPrompt, userContent, {
         temperature: translationOptions.temperature,
         maxTokens: translationOptions.maxTokens,
+        signal: controller?.signal,
       });
     }
     if (!result.success) return result;
@@ -2498,6 +2540,10 @@ async function handleTranslateContent(
   } catch (error) {
     console.error("[YouTube Digest] Translation error:", error);
     return localAiFailure(error, "Translation failed");
+  } finally {
+    if (controller && translationAbortControllers.get(requestId) === controller) {
+      translationAbortControllers.delete(requestId);
+    }
   }
 }
 
@@ -2512,13 +2558,14 @@ async function handleTranslateContent(
 async function callAiTranslation(
   systemPrompt,
   userContent,
-  { temperature = 0.3, maxTokens = 8192, responseFormat } = {},
+  { temperature = 0.3, maxTokens = 8192, responseFormat, signal } = {},
 ) {
   try {
     const { text } = await requestAiCompletion({
       temperature,
       maxTokens,
       responseFormat,
+      signal,
       messages: [
         { role: "system", content: systemPrompt },
         { role: "user", content: userContent },
@@ -2545,6 +2592,7 @@ async function callAiTranslation(
 globalThis.__YTD_TRANSLATION_TESTING__ = {
   requestAiCompletion,
   callAiTranslation,
+  cancelTranslationRequest,
   validateTranscriptBatchRequest,
   normalizeTranslatedSegmentBatch,
   handleTranslateContent,

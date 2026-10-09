@@ -22,18 +22,15 @@ test("all timestamped transcript row clicks use the selection-aware seek helper"
     /function seekFromTranscriptEntryClick\(event, seconds\)[\s\S]*?if \(hasNonCollapsedTextSelection\(\)\) \{[\s\S]*?event\.preventDefault\(\);[\s\S]*?event\.stopPropagation\(\);[\s\S]*?return;[\s\S]*?\}[\s\S]*?seekTo\(seconds\);/,
   );
 
-  const guardedRowHandlers = source.match(
-    /div\.addEventListener\("click", \(event\) =>\s+seekFromTranscriptEntryClick\(event, group\.start\),\s+\);/g,
-  );
-  assert.equal(
-    guardedRowHandlers?.length,
-    1,
-    "raw transcript rows must use the guard",
+  assert.match(
+    source,
+    /function renderTranscript\(\)[\s\S]*?renderTranscriptModeRows\(getActiveTranscriptSegments\(\), currentTranscriptMode\)/,
+    "all transcript modes must use the shared guarded row renderer",
   );
   assert.match(
     source,
     /div\.addEventListener\("click", \(event\) =>\s+seekFromTranscriptEntryClick\(event, segment\.start\),\s+\);/,
-    "translated-only and bilingual rows must use the guard",
+    "all rendered subtitle rows must use the guard",
   );
   assert.doesNotMatch(
     source,

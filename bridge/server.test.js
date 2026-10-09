@@ -2,12 +2,15 @@ const test = require("node:test");
 const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const fs = require("node:fs");
+const http = require("node:http");
 const { PassThrough } = require("node:stream");
 
 const {
   SerialQueue,
   buildCodexPrompt,
+  createServer,
   persistCreatorWorkspaceHandoff,
+  runCodex,
   runTraeWork,
   safeEqual,
   validateMessages,
@@ -113,6 +116,106 @@ test("bridge serializes queued work", async () => {
   });
   assert.deepEqual(await Promise.all([first, second]), [1, 2]);
   assert.deepEqual(order, ["first-start", "first-end", "second"]);
+});
+
+test("canceling a queued request removes it without running its task", async () => {
+  const queue = new SerialQueue(3);
+  const controller = new AbortController();
+  let finishFirst;
+  let secondRan = false;
+  const first = queue.add(() => new Promise((resolve) => { finishFirst = resolve; }));
+  const second = queue.add(() => { secondRan = true; }, controller.signal);
+
+  controller.abort();
+  await assert.rejects(second, { code: "AI_CANCELED" });
+  assert.equal(queue.pending.length, 0);
+  finishFirst("done");
+  assert.equal(await first, "done");
+  assert.equal(secondRan, false);
+});
+
+test("canceling a running Codex request terminates its child process", async () => {
+  const controller = new AbortController();
+  let killedWith;
+  const fakeSpawn = () => {
+    const child = new EventEmitter();
+    child.stdin = new PassThrough();
+    child.stdout = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = (signal) => {
+      killedWith = signal;
+      setImmediate(() => child.emit("close", null));
+    };
+    return child;
+  };
+  const pending = runCodex(
+    { messages: [{ role: "user", content: "Translate this." }] },
+    { codexPath: process.execPath, spawn: fakeSpawn, signal: controller.signal },
+  );
+  controller.abort();
+
+  await assert.rejects(pending, { code: "AI_CANCELED" });
+  assert.equal(killedWith, "SIGTERM");
+});
+
+test("canceling a running TraeWork request terminates its child process", async () => {
+  const controller = new AbortController();
+  let killedWith;
+  const fakeSpawn = () => {
+    const child = new EventEmitter();
+    child.stdin = new PassThrough();
+    child.stderr = new PassThrough();
+    child.kill = (signal) => {
+      killedWith = signal;
+      setImmediate(() => child.emit("close", null));
+    };
+    return child;
+  };
+  const pending = runTraeWork(
+    { messages: [{ role: "user", content: "Translate this." }] },
+    { traeWorkPath: process.execPath, spawn: fakeSpawn, signal: controller.signal },
+  );
+  controller.abort();
+
+  await assert.rejects(pending, { code: "AI_CANCELED" });
+  assert.equal(killedWith, "SIGTERM");
+});
+
+test("closing a bridge request aborts its running model job", { timeout: 5000 }, async () => {
+  let markStarted;
+  let markAborted;
+  const started = new Promise((resolve) => { markStarted = resolve; });
+  const aborted = new Promise((resolve) => { markAborted = resolve; });
+  const server = createServer({
+    config: { token: "test-token" },
+    handoffRoot: "/private/tmp",
+    runner: (_payload, { signal }) => new Promise((_resolve, reject) => {
+      signal.addEventListener("abort", () => {
+        markAborted();
+        reject(new Error("canceled"));
+      }, { once: true });
+      markStarted();
+    }),
+  });
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  try {
+    const request = http.request({
+      hostname: "127.0.0.1",
+      port: server.address().port,
+      path: "/v1/complete",
+      method: "POST",
+      headers: { "x-youtube-digest-token": "test-token" },
+    });
+    request.on("error", () => {});
+    request.end(JSON.stringify({
+      messages: [{ role: "user", content: "Translate this." }],
+    }));
+    await started;
+    request.destroy();
+    await aborted;
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 });
 
 test("Creator Workspace helper supplies only the server-owned inbox root", () => {

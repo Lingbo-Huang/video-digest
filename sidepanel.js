@@ -65,11 +65,16 @@ function refreshLocalizedDynamicUi() {
     renderLocalizedError();
   }
   if (currentTranscript) {
-    if (currentTranscriptMode === "original") renderTranscript();
-    else translateTranscript();
+    cancelPendingTranslations();
+    translationGeneration += 1;
+    translationWorkCount = 0;
+    setTranslatingSpinner(false);
+    renderTranscript();
     setupExplainFeature();
   }
   if (currentAnalysis) renderAnalysisResults(currentAnalysis);
+  else resetOverviewPlaceholders();
+  updateOverviewButton();
   if (document.querySelector('[data-panel="notes"]')?.classList.contains("active")) {
     const showAll = document
       .getElementById("notesFilterAll")
@@ -112,15 +117,25 @@ async function initializeInterfaceLanguage() {
 let currentTranscriptMode = "original";
 let translationGeneration = 0; // Invalidates responses from older UI modes/videos.
 let translationWorkCount = 0;
-let transcriptScrollObserver = null;
+const activeTranslationRequestIds = new Set();
 // Stable keys include the video, source mode, language, and semantic segment ID.
 let transcriptParagraphCache = new Map();
 const TRANSLATION_MESSAGE_TIMEOUT_MS = 190_000;
 
+function cancelTranslationInBackground(requestId) {
+  try {
+    Promise.resolve(
+      chrome.runtime.sendMessage({ action: "cancelTranslation", requestId }),
+    ).catch(() => {});
+  } catch {
+    // The side panel can be unloaded while its last cancellation is sent.
+  }
+}
+
 /**
  * Prevent a stopped service worker or dead message channel from leaving the
- * transcript queue stuck forever. The underlying Chrome message cannot be
- * cancelled, so settled guards deliberately ignore any late response.
+ * transcript queue stuck forever. The cancellation message stops its matching
+ * background fetch; settled guards still ignore a late Chrome reply.
  */
 function sendTranslationMessage(message) {
   return new Promise((resolve, reject) => {
@@ -134,6 +149,9 @@ function sendTranslationMessage(message) {
     };
 
     timeoutId = setTimeout(() => {
+      if (message.action === "translateContent" && message.requestId) {
+        cancelTranslationInBackground(message.requestId);
+      }
       finish(
         reject,
         new Error(
@@ -156,6 +174,15 @@ function sendTranslationMessage(message) {
     );
   });
 }
+
+function cancelPendingTranslations() {
+  for (const requestId of activeTranslationRequestIds) {
+    cancelTranslationInBackground(requestId);
+  }
+  activeTranslationRequestIds.clear();
+}
+
+window.addEventListener?.("pagehide", cancelPendingTranslations);
 
 // --- Auto-scroll state (follow video playback in transcript) ---
 let autoScrollEnabled = true; // True = scroll transcript to follow video playback
@@ -475,6 +502,8 @@ function setupEventListeners() {
       handleTranscriptModeChange(button.dataset.transcriptMode);
     });
   });
+  document.getElementById("translateAllBtn")?.addEventListener("click", translateTranscript);
+  document.getElementById("generateOverviewBtn")?.addEventListener("click", triggerAnalysis);
 
   // Follow playback button — re-enables auto-scroll after user scrolled away
   document
@@ -632,7 +661,6 @@ function transcriptFailureLocalization(result = {}) {
 // ============================================================
 
 async function startDigest(videoId, videoUrl, source = null) {
-  const requestGeneration = ++digestGeneration;
   const detected = source || YTD_PLATFORMS.detectVideoSource(videoUrl);
   if (detected) {
     currentPlatform = detected.platform;
@@ -641,16 +669,21 @@ async function startDigest(videoId, videoUrl, source = null) {
   }
   const nextContentKey = detected?.contentKey || `${currentPlatform}:${videoId}`;
   // Check if we already have this video loaded in memory
-  if (nextContentKey === currentContentKey && currentAnalysis) {
+  if (nextContentKey === currentContentKey && currentTranscript) {
     showState("results");
     return;
   }
+  const requestGeneration = ++digestGeneration;
 
   // Every video change invalidates observer work and in-flight translations.
   if (nextContentKey !== currentContentKey) {
+    cancelPendingTranslations();
     translationGeneration += 1;
-    if (transcriptScrollObserver) transcriptScrollObserver.disconnect();
-    transcriptScrollObserver = null;
+    translationWorkCount = 0;
+    activeTranslationQueue = null;
+    setTranslatingSpinner(false);
+    currentTranscriptMode = "original";
+    setTranscriptModeButtons("original");
   }
 
   // Check cache for this video
@@ -693,7 +726,8 @@ async function startDigest(videoId, videoUrl, source = null) {
     if (currentAnalysis) {
       renderAnalysisResults(currentAnalysis);
       highlightMomentsOnPage(currentAnalysis.keyMoments);
-    }
+    } else resetOverviewPlaceholders();
+    updateOverviewButton();
 
     showState("results");
     document.getElementById("tabsNav").style.display = "flex";
@@ -703,7 +737,6 @@ async function startDigest(videoId, videoUrl, source = null) {
 
     // Setup explain feature
     setupExplainFeature();
-    if (currentTranscriptMode !== "original") translateTranscript();
     return;
   }
 
@@ -716,6 +749,8 @@ async function startDigest(videoId, videoUrl, source = null) {
   currentTranscriptTimestamped = null;
   currentTranscriptLanguage = null;
   isAnalysisLoading = false;
+  resetOverviewPlaceholders();
+  updateOverviewButton();
   document
     .getElementById("creatorWorkspaceHandoffStatus")
     ?.setAttribute("hidden", "");
@@ -776,6 +811,7 @@ async function startDigest(videoId, videoUrl, source = null) {
   currentTranscriptText = transcriptResult.transcriptText;
   currentTranscriptTimestamped = transcriptResult.transcriptTextTimestamped;
   currentTranscriptLanguage = transcriptResult.language || null;
+  updateOverviewButton();
   if (transcriptResult.videoInfo) {
     currentVideoTitle = transcriptResult.videoInfo.title || currentVideoTitle;
     currentChannelName = transcriptResult.videoInfo.channelName || currentChannelName;
@@ -796,13 +832,10 @@ async function startDigest(videoId, videoUrl, source = null) {
 
   // Setup explain feature for text selection
   setupExplainFeature();
-  if (currentTranscriptMode !== "original") translateTranscript();
-
   // Save transcript to cache (without analysis)
   await saveToCache(videoId);
 
-  // DON'T run LLM analysis automatically - wait for user to click Overview tab
-  // This saves tokens when user just wants to see the transcript
+  // Translation and overview generation require an explicit button click.
 }
 
 // ============================================================
@@ -1006,58 +1039,7 @@ function seekFromTranscriptEntryClick(event, seconds) {
 
 function renderTranscript() {
   if (!currentTranscript) return;
-
-  const transcriptList = document.getElementById("transcriptList");
-  transcriptList.innerHTML = "";
-
-  // Show a small badge indicating the transcript came from the video's
-  // existing subtitles. (We no longer AI-transcribe audio, so subtitles
-  // are the only source.)
-  const existingBadge = document.getElementById("transcriptSourceBadge");
-  if (existingBadge) existingBadge.remove();
-
-  const badge = document.createElement("div");
-  badge.id = "transcriptSourceBadge";
-  badge.className = "transcript-source-badge";
-  badge.innerHTML = `<span class="source-dot source-dot--subs"></span> ${escapeHtml(t("fromVideoSubtitles", { label: getOriginalTranscriptLabel() }))}`;
-  transcriptList.parentElement.insertBefore(badge, transcriptList);
-
-  // Group entries using smart sentence-boundary + time-guardrail logic
-  const grouped = groupTranscriptEntries(currentTranscript);
-
-  grouped.forEach((group) => {
-    const div = document.createElement("div");
-    div.className = "transcript-entry";
-    div.dataset.seconds = group.start;
-
-    const minutes = Math.floor(group.start / 60);
-    const seconds = Math.floor(group.start % 60);
-    const timestamp = `${minutes}:${String(seconds).padStart(2, "0")}`;
-
-    div.innerHTML = `
-      <span class="transcript-time">${timestamp}</span>
-      <span class="transcript-text">${renderSubtitleInlineMarkup(group.text)}</span>
-      <button class="context-ask-btn transcript-context-ask-btn" type="button" title="${escapeHtml(t("askTranscriptTitle"))}">${escapeHtml(t("ask"))}</button>
-    `;
-
-    div.addEventListener("click", (event) =>
-      seekFromTranscriptEntryClick(event, group.start),
-    );
-    attachContextAskButton(div, {
-      sourceType: "transcript",
-      sourceLabel: t("sourceTranscript"),
-      sourceText: group.text,
-      surroundingContext: getTranscriptContextAtTime(group.start),
-      videoId: currentVideoId,
-      videoTitle: currentVideoTitle,
-      channelName: currentChannelName,
-      timestampSeconds: group.start,
-    });
-    transcriptList.appendChild(div);
-  });
-
-  // Start tracking video playback for auto-scroll
-  startPlaybackTracking();
+  renderTranscriptModeRows(getActiveTranscriptSegments(), currentTranscriptMode);
 }
 
 function copyTranscript() {
@@ -1186,11 +1168,6 @@ function switchTab(tabName) {
     startPlaybackTracking();
   } else {
     stopPlaybackTracking();
-  }
-
-  // Lazy-load LLM analysis when user switches to Overview tab
-  if (tabName === "overview" && !currentAnalysis && !isAnalysisLoading) {
-    triggerAnalysis();
   }
 
   if (tabName === "create") {
@@ -1369,15 +1346,35 @@ async function sendLearningPackToCreatorWorkspace(event) {
   }
 }
 
-/**
- * Triggers the LLM analysis (lazy-loaded when user clicks Overview or Quotes tab).
- * This saves tokens by not running analysis until needed.
- */
+function resetOverviewPlaceholders() {
+  const chapterList = document.getElementById("chapterList");
+  const quotesList = document.getElementById("quotesList");
+  if (chapterList) {
+    chapterList.innerHTML = `<li class="chapter-item" style="color: var(--text-muted); cursor: default; border-color: var(--border);">${escapeHtml(t("chaptersPlaceholder"))}</li>`;
+  }
+  if (quotesList) {
+    quotesList.innerHTML = `<div class="quote-item" style="color: var(--text-muted); border-left-color: var(--border); cursor: default;"><div class="quote-text" style="font-style: normal">${escapeHtml(t("quotesPlaceholder"))}</div></div>`;
+  }
+}
+
+function updateOverviewButton() {
+  const button = document.getElementById("generateOverviewBtn");
+  if (!button) return;
+  button.disabled = isAnalysisLoading || !!currentAnalysis || !currentTranscriptTimestamped;
+  button.textContent = t(
+    isAnalysisLoading ? "generatingOverview" : currentAnalysis ? "overviewReady" : "generateOverview",
+  );
+}
+
+/** Generates chapters and key quotes only after the explicit button click. */
 async function triggerAnalysis() {
   if (!currentTranscriptTimestamped || isAnalysisLoading || currentAnalysis)
     return;
 
+  const requestContentKey = currentContentKey;
+  const requestGeneration = digestGeneration;
   isAnalysisLoading = true;
+  updateOverviewButton();
 
   // Show loading indicators in the Overview tab
   const chapterList = document.getElementById("chapterList");
@@ -1399,11 +1396,14 @@ async function triggerAnalysis() {
       videoDescription: currentVideoDescription,
       videoDuration: currentVideoDuration,
     });
+    if (
+      requestContentKey !== currentContentKey ||
+      requestGeneration !== digestGeneration
+    ) return;
 
     if (!analysisResult.success) {
       if (chapterList)
         chapterList.innerHTML = `<li class="chapter-item" style="color: var(--accent); border: none;">${escapeHtml(t("analysisFailed", { error: analysisResult.error || t("unknownError") }))}</li>`;
-      isAnalysisLoading = false;
       return;
     }
 
@@ -1414,12 +1414,22 @@ async function triggerAnalysis() {
     // Save to cache now that we have analysis
     await saveToCache(currentVideoId);
   } catch (error) {
+    if (
+      requestContentKey !== currentContentKey ||
+      requestGeneration !== digestGeneration
+    ) return;
     console.error("[YouTube Digest Panel] Analysis error:", error);
     if (chapterList)
       chapterList.innerHTML = `<li class="chapter-item" style="color: var(--accent); border: none;">${escapeHtml(t("genericError", { error: error.message }))}</li>`;
+  } finally {
+    if (
+      requestContentKey === currentContentKey &&
+      requestGeneration === digestGeneration
+    ) {
+      isAnalysisLoading = false;
+      updateOverviewButton();
+    }
   }
-
-  isAnalysisLoading = false;
 }
 
 // ============================================================
@@ -2458,38 +2468,30 @@ async function handleTranscriptModeChange(mode) {
   if (!["original", "zh", "bilingual"].includes(mode)) return;
   if (mode === currentTranscriptMode) return;
 
+  cancelPendingTranslations();
   currentTranscriptMode = mode;
   translationGeneration += 1;
   translationWorkCount = 0;
+  activeTranslationQueue = null;
   setTranslatingSpinner(false);
-  if (transcriptScrollObserver) transcriptScrollObserver.disconnect();
-  transcriptScrollObserver = null;
   setTranscriptModeButtons(mode);
-
-  if (mode === "original") {
-    renderTranscript();
-    return;
-  }
-
-  await translateTranscript();
+  renderTranscript();
 }
 
-function renderTranscriptSegmentContent(segment, mode, translated, error) {
+function renderTranscriptSegmentContent(segment, mode, translated, error, pending = false) {
   const original = renderSubtitleInlineMarkup(segment.text);
-  let translationHtml = "";
-  if (translated) {
-    translationHtml = renderSubtitleInlineMarkup(translated);
-  } else if (error) {
-    translationHtml = `${escapeHtml(error)}<button class="translation-retry-btn" type="button">${escapeHtml(t("retry"))}</button>`;
-  } else {
-    translationHtml = escapeHtml(t("waitingTranslation"));
+  if (mode === "original") {
+    return `<span class="transcript-copy"><span class="transcript-original">${original}</span></span>`;
   }
-
-  if (mode === "bilingual") {
-    return `<span class="transcript-copy"><span class="transcript-original">${original}</span><span class="transcript-translation ${translated ? "" : error ? "translation-error" : "translation-pending"}">${translationHtml}</span></span>`;
+  const translationHtml = translated
+    ? renderSubtitleInlineMarkup(translated)
+    : escapeHtml(error || (pending ? t("waitingTranslation") : t("translationNotRequested")));
+  const translationClass = translated ? "" : error ? "translation-error" : "translation-pending";
+  const translation = `<span class="transcript-translation ${translationClass}">${translationHtml}</span>`;
+  if (mode === "zh" && translated) {
+    return `<span class="transcript-copy">${translation}</span>`;
   }
-
-  return `<span class="transcript-copy"><span class="transcript-translation ${translated ? "" : error ? "translation-error" : "translation-pending"}">${translationHtml}</span></span>`;
+  return `<span class="transcript-copy"><span class="transcript-original">${original}</span>${translation}</span>`;
 }
 
 function renderTranscriptModeRows(segments, mode) {
@@ -2504,7 +2506,9 @@ function renderTranscriptModeRows(segments, mode) {
   badge.className = "transcript-source-badge";
   const originalLabel = getOriginalTranscriptLabel();
   const modeLabel =
-    mode === "bilingual"
+    mode === "original"
+      ? originalLabel
+      : mode === "bilingual"
       ? t("bilingualModeLabel", { original: originalLabel })
       : t("translatedModeLabel", { original: originalLabel });
   badge.innerHTML = `<span class="source-dot source-dot--subs"></span> ${escapeHtml(t("fromVideoSubtitles", { label: modeLabel }))}`;
@@ -2516,7 +2520,7 @@ function renderTranscriptModeRows(segments, mode) {
     const cached = transcriptParagraphCache.get(
       transcriptTranslationCacheKey(segment),
     );
-    div.className = `transcript-entry ${cached ? "translated" : "translating"}`;
+    div.className = `transcript-entry ${cached ? "translated" : ""}`;
     div.dataset.seconds = segment.start;
     div.dataset.segmentId = segment.id;
     div.dataset.segmentIndex = index;
@@ -2527,7 +2531,10 @@ function renderTranscriptModeRows(segments, mode) {
     div.innerHTML = `
       <span class="transcript-time">${timestamp}</span>
       ${renderTranscriptSegmentContent(segment, mode, cached, "")}
-      <button class="context-ask-btn transcript-context-ask-btn" type="button" title="${escapeHtml(t("askTranscriptTitle"))}">${escapeHtml(t("ask"))}</button>
+      <span class="transcript-row-actions">
+        <button class="enhance-btn transcript-translate-btn" type="button">${escapeHtml(t("translateLine"))}</button>
+        <button class="context-ask-btn transcript-context-ask-btn" type="button" title="${escapeHtml(t("askTranscriptTitle"))}">${escapeHtml(t("ask"))}</button>
+      </span>
     `;
     div.addEventListener("click", (event) =>
       seekFromTranscriptEntryClick(event, segment.start),
@@ -2542,10 +2549,19 @@ function renderTranscriptModeRows(segments, mode) {
       channelName: currentChannelName,
       timestampSeconds: segment.start,
     });
+    div.querySelector(".transcript-translate-btn")?.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopPropagation();
+      if (currentTranscriptMode === "original") {
+        handleTranscriptModeChange("bilingual");
+      }
+      activeTranslationQueue?.enqueue(index, true, true);
+    });
     transcriptList.appendChild(div);
     rows.push(div);
   });
 
+  createTranslationQueue(segments);
   startPlaybackTracking();
   return rows;
 }
@@ -2600,21 +2616,8 @@ function updateTranslatedRow(segment, index, alignedItem, generation) {
   row.classList.toggle("translated", !!alignedItem.text);
   row.classList.toggle("translating", false);
   row.classList.toggle("translation-failed", !alignedItem.text);
-
-  const retry = row.querySelector(".translation-retry-btn");
-  if (retry) {
-    ["mousedown", "mouseup"].forEach((eventName) => {
-      retry.addEventListener(eventName, (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-      });
-    });
-    retry.addEventListener("click", (event) => {
-      event.preventDefault();
-      event.stopPropagation();
-      retryTranslationSegment(index, generation);
-    });
-  }
+  const translateButton = row.querySelector(".transcript-translate-btn");
+  if (translateButton) translateButton.disabled = false;
 }
 
 let activeTranslationQueue = null;
@@ -2627,10 +2630,13 @@ async function requestTranscriptTranslationBatch(
   mode,
 ) {
   const sourceBatch = indices.map((index) => segments[index]);
+  const requestId = crypto.randomUUID();
+  activeTranslationRequestIds.add(requestId);
   setTranslatingSpinner(true);
   try {
     const result = await sendTranslationMessage({
       action: "translateContent",
+      requestId,
       content: {
         segments: sourceBatch.map(({ id, text }) => ({ id, text })),
       },
@@ -2672,52 +2678,60 @@ async function requestTranscriptTranslationBatch(
       );
     });
   } finally {
-    setTranslatingSpinner(false);
+    activeTranslationRequestIds.delete(requestId);
+    if (generation === translationGeneration) setTranslatingSpinner(false);
   }
 }
 
-function retryTranslationSegment(index, generation) {
-  if (generation !== translationGeneration || !activeTranslationQueue) return;
+function markTranslationPending(segment, index) {
   const row = document.querySelector(
     `.transcript-entry[data-segment-index="${index}"]`,
   );
-  if (row) {
-    row.classList.add("translating");
-    row.classList.remove("translation-failed");
-    const translation = row.querySelector(".transcript-translation");
-    if (translation) {
-      translation.className = "transcript-translation translation-pending";
-      translation.textContent = t("retrying");
-    }
+  if (!row) return;
+  row.classList.add("translating");
+  row.classList.remove("translation-failed");
+  const copy = row.querySelector(".transcript-copy");
+  if (copy) {
+    copy.outerHTML = renderTranscriptSegmentContent(
+      segment,
+      currentTranscriptMode,
+      "",
+      "",
+      true,
+    );
   }
-  activeTranslationQueue.enqueue(index, true);
+  const translateButton = row.querySelector(".transcript-translate-btn");
+  if (translateButton) translateButton.disabled = true;
 }
 
 /**
- * Renders immediately, translates the first small batch, then observes the
- * remaining rows. Batches are sequential so the provider is never flooded.
+ * One queue serves both explicit per-line and whole-transcript requests.
+ * Nothing is enqueued merely by rendering or changing display mode.
  */
-async function translateTranscript() {
-  const segments = getActiveTranscriptSegments();
-  if (!segments.length || currentTranscriptMode === "original") return;
-
-  translationGeneration += 1;
+function createTranslationQueue(segments) {
   const generation = translationGeneration;
   const videoId = currentVideoId;
   const mode = currentTranscriptMode;
-  if (transcriptScrollObserver) transcriptScrollObserver.disconnect();
-
-  const rows = renderTranscriptModeRows(segments, mode);
   const queue = [];
   const queued = new Set();
+  const active = new Set();
   let processing = false;
 
   const processNext = async () => {
     if (processing || queue.length === 0 || generation !== translationGeneration)
       return;
     processing = true;
-    const indices = queue.splice(0, 12);
-    indices.forEach((index) => queued.delete(index));
+    const first = queue.shift();
+    const indices = [first.index];
+    if (!first.individual) {
+      while (queue.length && !queue[0].individual && indices.length < 12) {
+        indices.push(queue.shift().index);
+      }
+    }
+    indices.forEach((index) => {
+      queued.delete(index);
+      active.add(index);
+    });
     try {
       await requestTranscriptTranslationBatch(
         indices,
@@ -2727,47 +2741,38 @@ async function translateTranscript() {
         mode,
       );
     } finally {
+      indices.forEach((index) => active.delete(index));
       processing = false;
       if (queue.length && generation === translationGeneration) processNext();
     }
   };
 
-  const enqueue = (index, force = false) => {
+  const enqueue = (index, force = false, individual = true) => {
+    if (generation !== translationGeneration) return;
     if (!Number.isInteger(index) || !segments[index]) return;
     const cached = transcriptParagraphCache.has(
       transcriptTranslationCacheKey(segments[index]),
     );
-    if ((!force && cached) || queued.has(index)) return;
-    queue.push(index);
+    if ((!force && cached) || queued.has(index) || active.has(index)) return;
+    queue.push({ index, individual });
     queued.add(index);
-    // Let all entries reported in the same viewport turn collect before the
-    // worker starts, producing one small contextual multi-segment request.
+    markTranslationPending(segments[index], index);
+    // Collect whole-transcript rows into bounded batches; individual clicks
+    // remain single-segment requests, still processed in the same queue.
     Promise.resolve().then(processNext);
   };
-  activeTranslationQueue = { enqueue };
+  activeTranslationQueue = {
+    enqueue,
+    enqueueAll: () => segments.forEach((_, index) => enqueue(index, false, false)),
+  };
+}
 
-  transcriptScrollObserver = new IntersectionObserver(
-    (observerEntries) => {
-      observerEntries
-        .filter((entry) => entry.isIntersecting)
-        .sort(
-          (a, b) =>
-            Number(a.target.dataset.segmentIndex) -
-            Number(b.target.dataset.segmentIndex),
-        )
-        .forEach((entry) => enqueue(Number(entry.target.dataset.segmentIndex)));
-    },
-    {
-      root: document.getElementById("contentArea"),
-      rootMargin: "320px 0px",
-      threshold: 0,
-    },
-  );
-
-  rows.forEach((row, index) => {
-    if (!row.classList.contains("translated")) transcriptScrollObserver.observe(row);
-    if (index < 3) enqueue(index);
-  });
+function translateTranscript() {
+  if (!currentTranscript?.length) return;
+  if (currentTranscriptMode === "original") {
+    handleTranscriptModeChange("bilingual");
+  }
+  activeTranslationQueue?.enqueueAll();
 }
 
 function setTranslatingSpinner(show) {
@@ -2782,6 +2787,8 @@ function setTranslatingSpinner(show) {
 // not read this object at runtime.
 globalThis.__YTD_TRANSCRIPT_TESTING__ = {
   sendTranslationMessage,
+  cancelPendingTranslations,
+  activeTranslationRequestIds,
   groupTranscriptEntries,
   splitOversizedThought,
   alignTranslatedSegmentBatch,

@@ -57,8 +57,8 @@
         <div class="welcome-icon">&#9655;</div>
         <div class="welcome-title" data-i18n="readyTitle">Ready to Digest</div>
         <div class="welcome-desc" data-i18n="readyDesc">
-          Navigate to a YouTube or Bilibili video and click the extension icon to get an
-          AI-powered digest.
+          Open a YouTube or Bilibili video to view its subtitles. Translation and
+          overview generation start only when you choose them.
         </div>
       </div>
 
@@ -132,6 +132,7 @@
                 </div>
               </div>
               <div class="transcript-actions">
+                <button class="enhance-btn primary-action-btn" id="translateAllBtn" type="button" data-i18n="translateAll">Translate all</button>
                 <button class="enhance-btn" id="copyTranscriptBtn" data-i18n="copy">Copy</button>
                 <button class="enhance-btn" id="exportTranscriptBtn">
                   <span data-i18n="export">Export</span>
@@ -146,7 +147,10 @@
         <div class="tab-panel" data-panel="overview">
           <!-- Chapters -->
           <div class="section">
-            <div class="section-title" data-i18n="chapters">Chapters</div>
+            <div class="section-header">
+              <div class="section-title" data-i18n="chapters">Chapters</div>
+              <button class="enhance-btn primary-action-btn" id="generateOverviewBtn" type="button" data-i18n="generateOverview">Generate overview</button>
+            </div>
             <ul class="chapter-list" id="chapterList">
               <li
                 class="chapter-item"
@@ -174,7 +178,7 @@
                 "
               >
                 <div class="quote-text" style="font-style: normal" data-i18n="quotesPlaceholder">
-                  Quotes will be extracted when you view this tab...
+                  Click Generate overview to extract key quotes.
                 </div>
               </div>
             </div>

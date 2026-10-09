@@ -151,16 +151,24 @@ ${wantsJson ? "- Return one valid JSON object with no Markdown fence or surround
 ${blocks}`;
 }
 
+function canceledRequestError() {
+  const error = new Error("Local AI request canceled");
+  error.code = "AI_CANCELED";
+  return error;
+}
+
 function runCodex(payload, options = {}) {
+  if (options.signal?.aborted) return Promise.reject(canceledRequestError());
   const prompt = buildCodexPrompt(payload);
   const runtimeDir = path.join(__dirname, "runtime");
   const codexPath = resolveCodexPath(options);
+  const spawnProcess = options.spawn || spawn;
   if (!codexPath) {
     return Promise.reject(new Error("Codex CLI is not installed or executable"));
   }
 
   return new Promise((resolve, reject) => {
-    const child = spawn(
+    const child = spawnProcess(
       codexPath,
       [
         "exec",
@@ -189,13 +197,23 @@ function runCodex(payload, options = {}) {
     let stdout = "";
     let stderr = "";
     let settled = false;
+    let killTimer;
+    const onAbort = () => {
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+      killTimer.unref?.();
+    };
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      clearTimeout(killTimer);
+      options.signal?.removeEventListener("abort", onAbort);
       if (error) reject(error);
       else resolve(value);
     };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
     const timeout = setTimeout(() => {
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 5_000).unref();
@@ -214,8 +232,17 @@ function runCodex(payload, options = {}) {
     child.stderr.on("data", (chunk) => {
       if (stderr.length < 65_536) stderr += chunk;
     });
-    child.on("error", (error) => finish(error));
+    child.on("error", (error) =>
+      finish(options.signal?.aborted ? canceledRequestError() : error),
+    );
+    child.stdin.on("error", (error) => {
+      if (!options.signal?.aborted) finish(error);
+    });
     child.on("close", (code) => {
+      if (options.signal?.aborted) {
+        finish(canceledRequestError());
+        return;
+      }
       if (code !== 0) {
         const detail = stderr
           .split("\n")
@@ -233,11 +260,12 @@ function runCodex(payload, options = {}) {
       }
       finish(null, text);
     });
-    child.stdin.end(prompt);
+    child.stdin.end(options.signal?.aborted ? "" : prompt);
   });
 }
 
 function runTraeWork(payload, options = {}) {
+  if (options.signal?.aborted) return Promise.reject(canceledRequestError());
   const prompt = buildCodexPrompt(payload);
   const traeWorkPath = resolveTraeWorkPath(options);
   const spawnProcess = options.spawn || spawn;
@@ -281,14 +309,24 @@ function runTraeWork(payload, options = {}) {
 
     let stderr = "";
     let settled = false;
+    let killTimer;
+    const onAbort = () => {
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 5_000);
+      killTimer.unref?.();
+    };
     const finish = (error, value) => {
       if (settled) return;
       settled = true;
       clearTimeout(timeout);
+      clearTimeout(killTimer);
+      options.signal?.removeEventListener("abort", onAbort);
       fs.rmSync(outputDir, { recursive: true, force: true });
       if (error) reject(error);
       else resolve(value);
     };
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    if (options.signal?.aborted) onAbort();
     const timeout = setTimeout(() => {
       child.kill("SIGTERM");
       setTimeout(() => child.kill("SIGKILL"), 5_000).unref();
@@ -299,8 +337,17 @@ function runTraeWork(payload, options = {}) {
     child.stderr.on("data", (chunk) => {
       if (stderr.length < 65_536) stderr += chunk;
     });
-    child.on("error", (error) => finish(error));
+    child.on("error", (error) =>
+      finish(options.signal?.aborted ? canceledRequestError() : error),
+    );
+    child.stdin.on("error", (error) => {
+      if (!options.signal?.aborted) finish(error);
+    });
     child.on("close", (code) => {
+      if (options.signal?.aborted) {
+        finish(canceledRequestError());
+        return;
+      }
       if (code !== 0) {
         const detail = stderr
           .split("\n")
@@ -336,7 +383,7 @@ function runTraeWork(payload, options = {}) {
       }
       finish(null, text);
     });
-    child.stdin.end(prompt);
+    child.stdin.end(options.signal?.aborted ? "" : prompt);
   });
 }
 
@@ -347,12 +394,22 @@ class SerialQueue {
     this.running = false;
   }
 
-  add(task) {
+  add(task, signal) {
+    if (signal?.aborted) return Promise.reject(canceledRequestError());
     if (this.pending.length >= this.limit) {
       return Promise.reject(new Error("Local AI request queue is full"));
     }
     return new Promise((resolve, reject) => {
-      this.pending.push({ task, resolve, reject });
+      const item = { task, resolve, reject, signal };
+      item.onAbort = () => {
+        const index = this.pending.indexOf(item);
+        if (index < 0) return;
+        this.pending.splice(index, 1);
+        signal.removeEventListener("abort", item.onAbort);
+        reject(canceledRequestError());
+      };
+      signal?.addEventListener("abort", item.onAbort, { once: true });
+      this.pending.push(item);
       this.drain();
     });
   }
@@ -363,9 +420,12 @@ class SerialQueue {
     while (this.pending.length) {
       const item = this.pending.shift();
       try {
-        item.resolve(await item.task());
+        if (item.signal?.aborted) throw canceledRequestError();
+        item.resolve(await item.task(item.signal));
       } catch (error) {
         item.reject(error);
+      } finally {
+        item.signal?.removeEventListener("abort", item.onAbort);
       }
     }
     this.running = false;
@@ -446,6 +506,12 @@ function createServer({
       return;
     }
 
+    const abortController = new AbortController();
+    request.once("aborted", () => abortController.abort());
+    response.once("close", () => {
+      if (!response.writableEnded) abortController.abort();
+    });
+
     let size = 0;
     const chunks = [];
     request.on("data", (chunk) => {
@@ -469,13 +535,16 @@ function createServer({
           return;
         }
         const provider = validateProvider(payload?.provider);
-        const result = await queue.add(() =>
-          provider === PROVIDERS.TRAEWORK
-            ? traeWorkRunner(payload)
-            : runner(payload),
+        const result = await queue.add(
+          (signal) =>
+            provider === PROVIDERS.TRAEWORK
+              ? traeWorkRunner(payload, { signal })
+              : runner(payload, { signal }),
+          abortController.signal,
         );
         sendJson(200, { ok: true, text: result });
       } catch (error) {
+        if (abortController.signal.aborted || response.destroyed) return;
         const message = error?.message || "Local AI request failed";
         const status = /queue is full/i.test(message)
           ? 429

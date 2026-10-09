@@ -15,7 +15,7 @@ installed Codex CLI or Trae CLI 2.0.
 ## Highlights
 
 - Read subtitle tracks exposed by the active YouTube or Bilibili player.
-- View the original transcript, Simplified Chinese, or an aligned bilingual view.
+- View the original transcript immediately; translate one passage or the whole transcript only when you click.
 - Generate chapters, key quotes, explanations, translations, and polished notes with Codex or TraeWork.
 - Ask focused questions about any transcript passage, Overview item, or saved Note, then save either provider's answer back to Notes.
 - Save timestamped notes and navigate back to the matching point in the video.
@@ -125,8 +125,8 @@ tool-agnostic personal content workflow that can consume these packs.
 ## Use
 
 1. Open a captioned YouTube or Bilibili video and click the extension icon.
-2. Read or translate the transcript.
-3. Open **Overview** for chapters and key quotes.
+2. Read the original transcript. Click **Translate** beside one passage or **Translate all** for the full transcript; the Chinese and bilingual controls only change the display of available translations.
+3. Open **Overview** and click **Generate overview** for chapters and key quotes.
 4. Select transcript text for an explanation.
 5. Choose **Ask** on a transcript passage, chapter, key quote, or Note. Both Codex and TraeWork answer inline.
 6. Save a useful answer to **Notes** with its source and timestamp preserved.

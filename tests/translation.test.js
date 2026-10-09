@@ -3,6 +3,7 @@ const assert = require("node:assert/strict");
 const fs = require("node:fs");
 const path = require("node:path");
 const vm = require("node:vm");
+const { webcrypto } = require("node:crypto");
 const sidepanelI18n = require("../sidepanel-i18n.js");
 
 const root = path.resolve(__dirname, "..");
@@ -19,6 +20,7 @@ function loadSidepanelHelpers({
     URL,
     TextDecoder,
     TextEncoder,
+    crypto: webcrypto,
     setTimeout: setTimeoutImpl,
     clearTimeout: clearTimeoutImpl,
     setInterval() {},
@@ -28,9 +30,10 @@ function loadSidepanelHelpers({
     window: { getSelection: () => null, close() {} },
     document: {
       addEventListener() {},
+      removeEventListener() {},
       querySelectorAll: () => [],
       querySelector: () => null,
-      getElementById: () => null,
+      getElementById: (id) => id === "followPlaybackBtn" ? { style: {} } : null,
       createElement: () => {
         let value = "";
         return {
@@ -56,8 +59,13 @@ function loadSidepanelHelpers({
     VIDEO_DIGEST_I18N: sidepanelI18n,
   };
   sandbox.globalThis = sandbox;
-  vm.runInNewContext(read("sidepanel.js"), sandbox);
-  return sandbox.__YTD_TRANSCRIPT_TESTING__;
+  const context = vm.createContext(sandbox);
+  vm.runInContext(read("sidepanel.js"), context);
+  return {
+    ...sandbox.__YTD_TRANSCRIPT_TESTING__,
+    evaluate: (source) => vm.runInContext(source, context),
+    setGlobal: (key, value) => { sandbox[key] = value; },
+  };
 }
 
 function loadBackgroundHelpers({
@@ -249,8 +257,14 @@ test("translation message watchdog uses the bridge hard limit", async () => {
   let timeoutCallback;
   let timeoutDelay;
   let clearCount = 0;
+  const sent = [];
   const helpers = loadSidepanelHelpers({
-    sendMessage: () => new Promise(() => {}),
+    sendMessage: (message) => {
+      sent.push(message);
+      return message.action === "cancelTranslation"
+        ? Promise.resolve({ success: true })
+        : new Promise(() => {});
+    },
     setTimeoutImpl(callback, delay) {
       timeoutCallback = callback;
       timeoutDelay = delay;
@@ -262,11 +276,172 @@ test("translation message watchdog uses the bridge hard limit", async () => {
     },
   });
 
-  const request = helpers.sendTranslationMessage({ action: "translateContent" });
+  const requestId = "44444444-4444-4444-8444-444444444444";
+  const request = helpers.sendTranslationMessage({ action: "translateContent", requestId });
   assert.equal(timeoutDelay, 190_000);
   timeoutCallback();
   await assert.rejects(request, /timed out after 190 seconds.*try again/i);
   assert.equal(clearCount, 1);
+  assert.deepEqual(JSON.parse(JSON.stringify(sent)), [
+    { action: "translateContent", requestId },
+    { action: "cancelTranslation", requestId },
+  ]);
+});
+
+test("side panel cancels all stale translation batches without touching other work", async () => {
+  const sent = [];
+  const helpers = loadSidepanelHelpers({
+    sendMessage: async (message) => {
+      sent.push(message);
+      return { success: true };
+    },
+  });
+  const first = "11111111-1111-4111-8111-111111111111";
+  const second = "22222222-2222-4222-8222-222222222222";
+  helpers.activeTranslationRequestIds.add(first);
+  helpers.activeTranslationRequestIds.add(second);
+
+  helpers.cancelPendingTranslations();
+  await Promise.resolve();
+
+  assert.deepEqual(JSON.parse(JSON.stringify(sent)), [
+    { action: "cancelTranslation", requestId: first },
+    { action: "cancelTranslation", requestId: second },
+  ]);
+  assert.equal(helpers.activeTranslationRequestIds.size, 0);
+});
+
+test("switching to Overview does not generate chapters automatically", () => {
+  const sent = [];
+  const helpers = loadSidepanelHelpers({
+    sendMessage: async (message) => { sent.push(message); return { success: true }; },
+  });
+  helpers.evaluate('currentTranscriptTimestamped = "0:00 Hello"');
+  helpers.evaluate('switchTab("overview")');
+  assert.equal(sent.length, 0);
+});
+
+test("overview analysis runs after the explicit generation action", async () => {
+  const sent = [];
+  const helpers = loadSidepanelHelpers({
+    sendMessage: async (message) => {
+      sent.push(message);
+      return { success: false, error: "test failure" };
+    },
+  });
+  helpers.evaluate('currentTranscriptTimestamped = "0:00 Hello"; currentContentKey = "youtube:video1"');
+  await helpers.evaluate('triggerAnalysis()');
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].action, "analyzeTranscript");
+});
+
+test("translation starts only when enqueued and single lines remain serial", async () => {
+  const sent = [];
+  const pending = [];
+  const helpers = loadSidepanelHelpers({
+    sendMessage: (message) => {
+      sent.push(message);
+      return new Promise((resolve) => pending.push(resolve));
+    },
+  });
+  const segments = Array.from({ length: 13 }, (_, index) => ({
+    id: `segment-${index}`,
+    text: `Sentence ${index}.`,
+    start: index,
+  }));
+  helpers.setGlobal("testSegments", segments);
+  helpers.evaluate('currentVideoId = "video1"; currentContentKey = "youtube:video1"; currentTranscriptMode = "bilingual"; updateCache = async () => {}; createTranslationQueue(testSegments)');
+  assert.equal(sent.length, 0);
+
+  helpers.evaluate('activeTranslationQueue.enqueue(0, true, true); activeTranslationQueue.enqueue(1, true, true)');
+  await new Promise(setImmediate);
+  assert.equal(sent.length, 1);
+  assert.equal(sent[0].content.segments.length, 1);
+  pending.shift()({ success: false, error: "test failure" });
+  await new Promise(setImmediate);
+  assert.equal(sent.length, 2);
+  assert.equal(sent[1].content.segments.length, 1);
+  pending.shift()({ success: false, error: "test failure" });
+  await new Promise(setImmediate);
+
+  helpers.evaluate('activeTranslationQueue.enqueueAll()');
+  await new Promise(setImmediate);
+  assert.equal(sent.length, 3);
+  assert.equal(sent[2].content.segments.length, 12);
+  pending.shift()({ success: false, error: "test failure" });
+  await new Promise(setImmediate);
+  assert.equal(sent.length, 4);
+  assert.equal(sent[3].content.segments.length, 1);
+  pending.shift()({ success: false, error: "test failure" });
+  await new Promise(setImmediate);
+});
+
+test("manual controls are the only overview and transcript generation entry points", () => {
+  const html = read("sidepanel.html");
+  const panel = read("sidepanel.js");
+  assert.match(html, /id="translateAllBtn"/);
+  assert.match(html, /id="generateOverviewBtn"/);
+  assert.match(panel, /\.transcript-translate-btn[\s\S]*?activeTranslationQueue\?\.enqueue\(index, true, true\)/);
+  const startDigestSource = panel.split("async function startDigest(")[1].split("// RENDERING")[0];
+  assert.doesNotMatch(startDigestSource, /translateTranscript\(/);
+  const modeSource = panel.split("async function handleTranscriptModeChange(")[1].split("function renderTranscriptSegmentContent(")[0];
+  assert.doesNotMatch(modeSource, /translateTranscript\(/);
+});
+
+test("background aborts only the selected in-flight translation", async () => {
+  let resolveBothStarted;
+  const bothStarted = new Promise((resolve) => { resolveBothStarted = resolve; });
+  const pending = [];
+  const helpers = loadBackgroundHelpers({
+    fetchImpl: async (url, options) => {
+      if (url.startsWith("chrome-extension://")) {
+        return { ok: true, text: async () => read("prompts/translation.md") };
+      }
+      return new Promise((resolve, reject) => {
+        pending.push({ resolve, reject, signal: options.signal });
+        if (pending.length === 2) resolveBothStarted();
+        options.signal.addEventListener("abort", () => {
+          const error = new Error("Aborted");
+          error.name = "AbortError";
+          reject(error);
+        }, { once: true });
+      });
+    },
+  });
+  const requestId = "33333333-3333-4333-8333-333333333333";
+  const otherRequestId = "55555555-5555-4555-8555-555555555555";
+  const translation = helpers.handleTranslateContent(
+    { segments: [{ id: "segment-0-0", text: "Hello." }] },
+    "transcriptBatch",
+    "zh",
+    "Video",
+    requestId,
+  );
+  const otherTranslation = helpers.handleTranslateContent(
+    { segments: [{ id: "segment-0-0", text: "World." }] },
+    "transcriptBatch",
+    "zh",
+    "Video",
+    otherRequestId,
+  );
+  await bothStarted;
+  assert.equal(helpers.cancelTranslationRequest(requestId), true);
+  const result = await translation;
+  assert.equal(result.success, false);
+  assert.equal(result.code, "AI_CANCELED");
+  assert.equal(helpers.cancelTranslationRequest(requestId), false);
+  assert.equal(pending[1].signal.aborted, false);
+  pending[1].resolve({
+    ok: true,
+    status: 200,
+    text: async () => JSON.stringify({
+      ok: true,
+      text: JSON.stringify({ segments: [{ id: "segment-0-0", text: "世界。" }] }),
+    }),
+  });
+  const otherResult = await otherTranslation;
+  assert.equal(otherResult.success, true);
+  assert.equal(otherResult.translatedContent.segments[0].text, "世界。");
 });
 
 test("Chinese prompt preserves bilingual-learning style rules", () => {
