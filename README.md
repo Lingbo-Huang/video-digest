@@ -18,6 +18,7 @@ installed Codex CLI or Trae CLI 2.0.
 - View the original transcript immediately; translate one passage or the whole transcript only when you click.
 - Generate chapters, key quotes, explanations, translations, and polished notes with Codex or TraeWork.
 - Ask focused questions about any transcript passage, Overview item, or saved Note, then save either provider's answer back to Notes.
+- Keep questions and translations running while you switch pages, then reopen them from **AI Tasks**.
 - Save timestamped notes and navigate back to the matching point in the video.
 - Use the Create page to combine the source, overview, notes, and your own reflection.
 - Send a bounded Learning Pack to a configurable local Creator Workspace.
@@ -51,7 +52,7 @@ Requests count against the limits of the account signed into the selected provid
 
 - Google Chrome 116 or newer
 - Node.js 18 or newer
-- At least one signed-in local AI provider: the [Codex CLI](https://developers.openai.com/codex/cli), or [Trae CLI 2.0](https://docs.trae.cn/cli_get-started-with-trae-code-cli-2)
+- At least one signed-in local AI provider: [Codex CLI](https://developers.openai.com/codex/cli) 0.162.1 or newer, or [Trae CLI 2.0](https://docs.trae.cn/cli_get-started-with-trae-code-cli-2)
 - A YouTube or Bilibili video with available captions
 
 ## Install
@@ -129,9 +130,10 @@ tool-agnostic personal content workflow that can consume these packs.
 3. Open **Overview** and click **Generate overview** for chapters and key quotes.
 4. Select transcript text for an explanation.
 5. Choose **Ask** on a transcript passage, chapter, key quote, or Note. Both Codex and TraeWork answer inline.
-6. Save a useful answer to **Notes** with its source and timestamp preserved.
-7. Save timestamped notes from the player or a quote.
-8. Open **Create**, add your reflection, and send the Learning Pack when ready.
+6. You may switch pages while a question or translation runs. Open **AI Tasks** to recover the task and its result.
+7. Save a useful answer to **Notes** with its source and timestamp preserved.
+8. Save timestamped notes from the player or a quote.
+9. Open **Create**, add your reflection, and send the Learning Pack when ready.
 
 ## Privacy and security
 

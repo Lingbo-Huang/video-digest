@@ -18,10 +18,18 @@ const MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 const CODEX_TIMEOUT_MS = 180_000;
 const TRAEWORK_TIMEOUT_MS = 180_000;
 const MAX_QUEUE_DEPTH = 20;
+const MAX_JOB_HISTORY = 80;
+const JOB_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const EXTENSION_ORIGIN = /^chrome-extension:\/\/[a-p]{32}$/;
 const PROVIDERS = Object.freeze({
   CODEX: "codex-local",
   TRAEWORK: "traework-local",
+});
+const TASK_PROFILES = Object.freeze({
+  default: Object.freeze({}),
+  question: Object.freeze({ model: "gpt-6.1-sol", reasoningEffort: "medium" }),
+  translation: Object.freeze({ model: "gpt-6-luna", reasoningEffort: "low" }),
+  overview: Object.freeze({ model: "gpt-6-luna", reasoningEffort: "low" }),
 });
 const TRAEWORK_CANDIDATES = Object.freeze([
   path.join(os.homedir(), ".local", "bin", "traex"),
@@ -104,6 +112,41 @@ function validateProvider(value) {
   return provider;
 }
 
+function validateTaskType(value) {
+  const taskType = value || "default";
+  if (!Object.hasOwn(TASK_PROFILES, taskType)) {
+    throw new Error("Unsupported local AI task type");
+  }
+  return taskType;
+}
+
+function codexArgsForPayload(payload) {
+  const profile = TASK_PROFILES[validateTaskType(payload?.taskType)];
+  const profileArgs = [];
+  if (profile.model) profileArgs.push("-m", profile.model);
+  if (profile.reasoningEffort) {
+    profileArgs.push(
+      "-c",
+      `model_reasoning_effort=${JSON.stringify(profile.reasoningEffort)}`,
+    );
+  }
+  return [
+    "exec",
+    ...profileArgs,
+    "--ephemeral",
+    "--skip-git-repo-check",
+    "--ignore-user-config",
+    "--ignore-rules",
+    "--sandbox",
+    "read-only",
+    "--color",
+    "never",
+    "--cd",
+    path.join(__dirname, "runtime"),
+    "-",
+  ];
+}
+
 function validateMessages(messages) {
   if (!Array.isArray(messages) || messages.length < 1 || messages.length > 8) {
     throw new Error("messages must contain 1 to 8 items");
@@ -170,20 +213,7 @@ function runCodex(payload, options = {}) {
   return new Promise((resolve, reject) => {
     const child = spawnProcess(
       codexPath,
-      [
-        "exec",
-        "--ephemeral",
-        "--skip-git-repo-check",
-        "--ignore-user-config",
-        "--ignore-rules",
-        "--sandbox",
-        "read-only",
-        "--color",
-        "never",
-        "--cd",
-        runtimeDir,
-        "-",
-      ],
+      codexArgsForPayload(payload),
       {
         cwd: runtimeDir,
         env: {
@@ -452,6 +482,66 @@ function createServer({
   handoffWriter = writeLearningPack,
 } = {}) {
   const queue = new SerialQueue();
+  const jobs = new Map();
+
+  const pruneJobs = () => {
+    const cutoff = Date.now() - JOB_TTL_MS;
+    for (const [id, job] of jobs) {
+      if (job.updatedAt < cutoff) jobs.delete(id);
+    }
+    if (jobs.size <= MAX_JOB_HISTORY) return;
+    [...jobs.values()]
+      .sort((left, right) => left.updatedAt - right.updatedAt)
+      .slice(0, jobs.size - MAX_JOB_HISTORY)
+      .forEach((job) => jobs.delete(job.id));
+  };
+
+  const publicJob = (job) => ({
+    id: job.id,
+    status: job.status,
+    taskType: job.taskType,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    ...(job.status === "completed" ? { text: job.text } : {}),
+    ...(job.status === "failed" ? { error: job.error } : {}),
+  });
+
+  const startJob = (payload) => {
+    const provider = validateProvider(payload?.provider);
+    const taskType = validateTaskType(payload?.taskType);
+    validateMessages(payload?.messages);
+    const now = Date.now();
+    const job = {
+      id: crypto.randomUUID(),
+      status: "pending",
+      taskType,
+      createdAt: now,
+      updatedAt: now,
+      controller: new AbortController(),
+    };
+    jobs.set(job.id, job);
+    pruneJobs();
+    queue
+      .add(async (signal) => {
+        job.status = "running";
+        job.updatedAt = Date.now();
+        return provider === PROVIDERS.TRAEWORK
+          ? traeWorkRunner(payload, { signal })
+          : runner(payload, { signal });
+      }, job.controller.signal)
+      .then((text) => {
+        job.status = "completed";
+        job.text = text;
+        job.updatedAt = Date.now();
+      })
+      .catch((error) => {
+        job.status = "failed";
+        job.error = error?.message || "Local AI request failed";
+        job.updatedAt = Date.now();
+      });
+    return job;
+  };
+
   return http.createServer((request, response) => {
     const origin = request.headers.origin || "";
     const validOrigin = !origin || EXTENSION_ORIGIN.test(origin);
@@ -459,7 +549,7 @@ function createServer({
       response.setHeader("Access-Control-Allow-Origin", origin);
       response.setHeader("Vary", "Origin");
     }
-    response.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+    response.setHeader("Access-Control-Allow-Methods", "GET, POST, DELETE, OPTIONS");
     response.setHeader(
       "Access-Control-Allow-Headers",
       "Content-Type, X-YouTube-Digest-Token",
@@ -493,16 +583,42 @@ function createServer({
       });
       return;
     }
+    const jobMatch = request.url?.match(/^\/v1\/jobs\/([0-9a-f-]{36})$/);
+    const isJobRead = request.method === "GET" && jobMatch;
+    const isJobCancel = request.method === "DELETE" && jobMatch;
+    const isJobCreate = request.method === "POST" && request.url === "/v1/jobs";
     const isCompletion =
       request.method === "POST" && request.url === "/v1/complete";
     const isCreatorWorkspaceHandoff =
       request.method === "POST" && request.url === "/v1/handoff";
-    if (!isCompletion && !isCreatorWorkspaceHandoff) {
+    if (
+      !isCompletion &&
+      !isCreatorWorkspaceHandoff &&
+      !isJobCreate &&
+      !isJobRead &&
+      !isJobCancel
+    ) {
       sendJson(404, { ok: false, error: "Not found" });
       return;
     }
     if (!safeEqual(request.headers["x-youtube-digest-token"], config.token)) {
       sendJson(401, { ok: false, error: "Invalid local bridge token" });
+      return;
+    }
+
+    if (isJobRead || isJobCancel) {
+      const job = jobs.get(jobMatch[1]);
+      if (!job) {
+        sendJson(404, { ok: false, error: "AI task not found" });
+        return;
+      }
+      if (isJobCancel && !new Set(["completed", "failed"]).has(job.status)) {
+        job.controller.abort();
+        job.status = "failed";
+        job.error = "Local AI request canceled";
+        job.updatedAt = Date.now();
+      }
+      sendJson(200, { ok: true, job: publicJob(job) });
       return;
     }
 
@@ -532,6 +648,11 @@ function createServer({
             handoffWriter,
           });
           sendJson(201, { ok: true, receipt });
+          return;
+        }
+        if (isJobCreate) {
+          const job = startJob(payload);
+          sendJson(202, { ok: true, job: publicJob(job) });
           return;
         }
         const provider = validateProvider(payload?.provider);
@@ -577,7 +698,9 @@ if (require.main === module) main();
 module.exports = {
   SerialQueue,
   PROVIDERS,
+  TASK_PROFILES,
   buildCodexPrompt,
+  codexArgsForPayload,
   createServer,
   getProviderStatuses,
   persistCreatorWorkspaceHandoff,
@@ -587,6 +710,7 @@ module.exports = {
   runCodex,
   runTraeWork,
   safeEqual,
+  validateTaskType,
   validateProvider,
   validateMessages,
 };

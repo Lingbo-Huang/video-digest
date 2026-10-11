@@ -26,10 +26,14 @@ const CREATOR_WORKSPACE_HANDOFF_MAX_RESPONSE_BYTES = 64 * 1024;
 const BILIBILI_SUBTITLE_TIMEOUT_MS = 15_000;
 const BILIBILI_SUBTITLE_MAX_RESPONSE_BYTES = 8 * 1024 * 1024;
 const BILIBILI_METADATA_TIMEOUT_MS = 15_000;
+const AI_TASKS_STORAGE_KEY = "video_digest_ai_tasks_v1";
+const AI_TASK_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+const AI_TASK_MAX_COUNT = 50;
 const debugLog = (...args) => {
   if (DEBUG) console.log(...args);
 };
 const translationAbortControllers = new Map();
+let aiTaskStorageMutation = Promise.resolve();
 
 function canceledAiRequest() {
   const error = new Error("Translation request canceled");
@@ -103,6 +107,7 @@ async function requestAiCompletion({
   temperature,
   responseFormat,
   signal,
+  taskType = "default",
 }) {
   const settings = await getSettings();
   const bridge = globalThis.YTD_LOCAL_BRIDGE;
@@ -116,6 +121,7 @@ async function requestAiCompletion({
     messages,
     maxTokens,
     responseFormat,
+    taskType,
   };
   if (typeof temperature === "number") body.temperature = temperature;
 
@@ -177,6 +183,225 @@ async function requestAiCompletion({
     clearTimeout(hardTimeoutId);
     signal?.removeEventListener("abort", abortFromCaller);
   }
+}
+
+async function readAiTasks() {
+  const stored = await chrome.storage.local
+    .get(AI_TASKS_STORAGE_KEY)
+    .catch(() => ({}));
+  const cutoff = Date.now() - AI_TASK_RETENTION_MS;
+  return (Array.isArray(stored[AI_TASKS_STORAGE_KEY])
+    ? stored[AI_TASKS_STORAGE_KEY]
+    : []
+  )
+    .filter((task) => task && Number(task.updatedAt) >= cutoff)
+    .sort((left, right) => Number(right.createdAt) - Number(left.createdAt))
+    .slice(0, AI_TASK_MAX_COUNT);
+}
+
+async function writeAiTasks(tasks) {
+  await chrome.storage.local.set({
+    [AI_TASKS_STORAGE_KEY]: tasks
+      .sort((left, right) => Number(right.createdAt) - Number(left.createdAt))
+      .slice(0, AI_TASK_MAX_COUNT),
+  });
+}
+
+async function saveAiTask(task) {
+  const operation = aiTaskStorageMutation.then(async () => {
+    const tasks = await readAiTasks();
+    const index = tasks.findIndex((item) => item.id === task.id);
+    if (index >= 0) tasks[index] = task;
+    else tasks.unshift(task);
+    await writeAiTasks(tasks);
+    return task;
+  });
+  aiTaskStorageMutation = operation.catch(() => {});
+  return operation;
+}
+
+async function getSavedAiTask(taskId) {
+  const tasks = await readAiTasks();
+  return tasks.find((task) => task.id === taskId) || null;
+}
+
+async function bridgeJson(pathname, { method = "GET", body } = {}) {
+  const bridge = globalThis.YTD_LOCAL_BRIDGE;
+  if (!bridge?.baseUrl || !bridge?.token) {
+    throw new Error("Local AI bridge configuration is missing.");
+  }
+  const response = await fetch(`${bridge.baseUrl}${pathname}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "X-YouTube-Digest-Token": bridge.token,
+    },
+    ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok) {
+    const error = new Error(data.error || `Local AI error: ${response.status}`);
+    error.status = response.status;
+    throw error;
+  }
+  return data;
+}
+
+async function submitAiJob({ messages, maxTokens, responseFormat, taskType }) {
+  const settings = await getSettings();
+  const data = await bridgeJson("/v1/jobs", {
+    method: "POST",
+    body: {
+      provider: settings.provider,
+      messages,
+      maxTokens,
+      responseFormat,
+      taskType,
+    },
+  });
+  if (!data?.job?.id) throw new Error("Local AI bridge did not create a task.");
+  return data.job;
+}
+
+async function startContextQuestionTask(payload) {
+  const request = YTD_QUESTION_ANSWER.normalizeQuestionRequest(payload);
+  const variables = {
+    videoTitle: request.videoTitle,
+    sourceLabel: request.sourceLabel,
+    timestamp: YTD_QUESTION_ANSWER.formatTimestamp(request.timestampSeconds),
+    sourceText: request.sourceText,
+    surroundingContext: request.surroundingContext || "Not available",
+    question: request.question,
+  };
+  const [systemPrompt, userPrompt] = await Promise.all([
+    loadPromptSection("context-question.md", "System prompt", variables),
+    loadPromptSection("context-question.md", "User prompt", variables),
+  ]);
+  const job = await submitAiJob({
+    taskType: "question",
+    maxTokens: 1800,
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: userPrompt },
+    ],
+  });
+  const task = {
+    id: job.id,
+    kind: "question",
+    status: job.status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    request,
+  };
+  await saveAiTask(task);
+  return { success: true, task };
+}
+
+async function startTranslationTask({
+  content,
+  contentType,
+  targetLanguage,
+  videoTitle,
+  platform,
+  videoId,
+  pageNumber,
+  contentKey,
+}) {
+  if (targetLanguage !== "zh") throw new Error("Unsupported translation target");
+  if (contentType !== "transcriptBatch") {
+    throw new Error("Unsupported translation content type");
+  }
+  const sourceSegments = validateTranscriptBatchRequest(content);
+  const baseRules = await getTranslationBaseRules(targetLanguage);
+  const systemPrompt = await loadPromptSection(
+    "translation.md",
+    "Transcript batch translation",
+    {
+      langName: "Simplified Chinese",
+      videoTitle: videoTitle || "Unknown",
+      baseRules,
+    },
+  );
+  const sourceCharacters = sourceSegments.reduce(
+    (total, segment) => total + segment.text.length,
+    0,
+  );
+  const job = await submitAiJob({
+    taskType: "translation",
+    maxTokens: Math.min(8192, Math.max(1536, Math.ceil(sourceCharacters * 1.25))),
+    responseFormat: { type: "json_object" },
+    messages: [
+      { role: "system", content: systemPrompt },
+      { role: "user", content: JSON.stringify({ segments: sourceSegments }) },
+    ],
+  });
+  const task = {
+    id: job.id,
+    kind: "translation",
+    status: job.status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    request: {
+      platform: platform === "bilibili" ? "bilibili" : "youtube",
+      videoId: String(videoId || ""),
+      pageNumber: Math.max(1, Number(pageNumber) || 1),
+      contentKey: String(contentKey || ""),
+      videoTitle: String(videoTitle || "").slice(0, 500),
+      segments: sourceSegments,
+    },
+  };
+  await saveAiTask(task);
+  return { success: true, task };
+}
+
+async function refreshAiTask(taskId) {
+  const task = await getSavedAiTask(taskId);
+  if (!task) return { success: false, error: "AI task not found" };
+  if (new Set(["completed", "failed"]).has(task.status)) {
+    return { success: true, task };
+  }
+  let job;
+  try {
+    const data = await bridgeJson(`/v1/jobs/${encodeURIComponent(task.id)}`);
+    job = data.job;
+  } catch (error) {
+    if (error.status !== 404) throw error;
+    task.status = "failed";
+    task.error = "The local AI task expired. Please retry.";
+    task.updatedAt = Date.now();
+    await saveAiTask(task);
+    return { success: true, task };
+  }
+  task.status = job.status;
+  task.updatedAt = job.updatedAt;
+  if (job.status === "failed") task.error = job.error || "Local AI task failed";
+  if (job.status === "completed") {
+    if (task.kind === "question") {
+      task.result = { answer: String(job.text || "").trim().slice(0, 8_000) };
+    } else if (task.kind === "translation") {
+      try {
+        const parsed = parseLooseJson(job.text || "");
+        const translatedContent = normalizeTranslatedSegmentBatch(
+          parsed,
+          task.request.segments,
+        );
+        if (!translatedContent.segments.some((segment) => segment.text)) {
+          throw new Error("Translation returned no valid Chinese segments");
+        }
+        task.result = { translatedContent };
+      } catch (error) {
+        task.status = "failed";
+        task.error = error.message || "Translation failed";
+      }
+    }
+  }
+  await saveAiTask(task);
+  return { success: true, task };
+}
+
+async function listAiTasks() {
+  await aiTaskStorageMutation;
+  return { success: true, tasks: await readAiTasks() };
 }
 
 function localAiFailure(error, fallbackMessage) {
@@ -387,6 +612,34 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
   if (message.action === "askContextQuestion") {
     handleContextQuestion(message.request)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.action === "startContextQuestionTask") {
+    startContextQuestionTask(message.request)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.action === "startTranslationTask") {
+    startTranslationTask(message.request || {})
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.action === "refreshAiTask") {
+    refreshAiTask(message.taskId)
+      .then(sendResponse)
+      .catch((err) => sendResponse({ success: false, error: err.message }));
+    return true;
+  }
+
+  if (message.action === "listAiTasks") {
+    listAiTasks()
       .then(sendResponse)
       .catch((err) => sendResponse({ success: false, error: err.message }));
     return true;
@@ -1783,6 +2036,7 @@ async function handleAnalyzeTranscript(
 
     debugLog("[YouTube Digest] Requesting video analysis", settings.aiModel);
     const { text: responseText } = await requestAiCompletion({
+      taskType: "overview",
       maxTokens: 8192,
       responseFormat: { type: "json_object" },
       messages: [
@@ -2314,6 +2568,7 @@ async function handleContextQuestion(payload) {
 
     debugLog("[YouTube Digest] Requesting focused context answer");
     const { text: answer } = await requestAiCompletion({
+      taskType: "question",
       maxTokens: 1800,
       messages: [
         { role: "system", content: systemPrompt },
@@ -2386,8 +2641,8 @@ async function getTranslationBaseRules(targetLanguage) {
 
 function validateTranscriptBatchRequest(content) {
   const segments = content?.segments;
-  if (!Array.isArray(segments) || segments.length < 1 || segments.length > 12) {
-    throw new Error("Transcript translation requires 1 to 12 segments");
+  if (!Array.isArray(segments) || segments.length < 1 || segments.length > 40) {
+    throw new Error("Transcript translation requires 1 to 40 segments");
   }
 
   const seenIds = new Set();
@@ -2562,6 +2817,7 @@ async function callAiTranslation(
 ) {
   try {
     const { text } = await requestAiCompletion({
+      taskType: "translation",
       temperature,
       maxTokens,
       responseFormat,

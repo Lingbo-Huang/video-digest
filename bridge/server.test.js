@@ -8,6 +8,7 @@ const { PassThrough } = require("node:stream");
 const {
   SerialQueue,
   buildCodexPrompt,
+  codexArgsForPayload,
   createServer,
   persistCreatorWorkspaceHandoff,
   runCodex,
@@ -15,6 +16,7 @@ const {
   safeEqual,
   validateMessages,
   validateProvider,
+  validateTaskType,
 } = require("./server.js");
 const { buildLearningPack } = require("../learning-pack.js");
 
@@ -51,6 +53,21 @@ test("bridge rejects provider names outside the local allowlist", () => {
   assert.equal(validateProvider(), "codex-local");
   assert.equal(validateProvider("traework-local"), "traework-local");
   assert.throws(() => validateProvider("shell-command"), /Unsupported local AI provider/);
+});
+
+test("Codex task profiles keep translation fast and questions high quality", () => {
+  assert.equal(validateTaskType("translation"), "translation");
+  assert.throws(() => validateTaskType("arbitrary"), /Unsupported local AI task type/);
+  const translationArgs = codexArgsForPayload({ taskType: "translation" });
+  assert.deepEqual(
+    translationArgs.slice(0, 5),
+    ["exec", "-m", "gpt-6-luna", "-c", 'model_reasoning_effort="low"'],
+  );
+  const questionArgs = codexArgsForPayload({ taskType: "question" });
+  assert.deepEqual(
+    questionArgs.slice(0, 5),
+    ["exec", "-m", "gpt-6.1-sol", "-c", 'model_reasoning_effort="medium"'],
+  );
 });
 
 test("TraeWork runner returns the CLI 2.0 final response inline", async () => {

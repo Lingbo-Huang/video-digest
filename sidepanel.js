@@ -61,6 +61,7 @@ function updateLanguageButton() {
 }
 
 function refreshLocalizedDynamicUi() {
+  renderAiTaskCenter();
   if (document.getElementById("errorState")?.style.display !== "none") {
     renderLocalizedError();
   }
@@ -121,6 +122,150 @@ const activeTranslationRequestIds = new Set();
 // Stable keys include the video, source mode, language, and semantic segment ID.
 let transcriptParagraphCache = new Map();
 const TRANSLATION_MESSAGE_TIMEOUT_MS = 190_000;
+const AI_TASK_POLL_INTERVAL_MS = 1200;
+let aiTaskCenterTasks = [];
+let aiTaskCenterPollTimer = null;
+
+function isAiTaskTerminal(task) {
+  return new Set(["completed", "failed"]).has(task?.status);
+}
+
+function aiTaskStatusLabel(status) {
+  if (status === "completed") return t("aiTaskCompleted");
+  if (status === "failed") return t("aiTaskFailed");
+  if (status === "running") return t("aiTaskRunning");
+  return t("aiTaskPending");
+}
+
+function aiTaskKindLabel(kind) {
+  return t(kind === "translation" ? "aiTaskTranslation" : "aiTaskQuestion");
+}
+
+function aiTaskExcerpt(task) {
+  if (task.kind === "translation") {
+    return task.request?.segments?.map((segment) => segment.text).join(" ") || "";
+  }
+  return task.request?.question || task.request?.sourceText || "";
+}
+
+function renderAiTaskCenter(tasks = aiTaskCenterTasks) {
+  aiTaskCenterTasks = Array.isArray(tasks) ? tasks : [];
+  const list = document.getElementById("aiTasksList");
+  const badge = document.getElementById("aiTasksBadge");
+  const activeCount = aiTaskCenterTasks.filter(
+    (task) => !isAiTaskTerminal(task),
+  ).length;
+  if (badge) {
+    badge.hidden = activeCount === 0;
+    badge.textContent = String(activeCount);
+  }
+  if (!list) return;
+  if (!aiTaskCenterTasks.length) {
+    list.innerHTML = `<div class="ai-task-empty">${escapeHtml(t("aiTasksEmpty"))}</div>`;
+    return;
+  }
+  list.innerHTML = "";
+  aiTaskCenterTasks.forEach((task) => {
+    const interactive = task.kind === "question";
+    const item = document.createElement(interactive ? "button" : "div");
+    if (interactive) item.type = "button";
+    item.className = "ai-task-item";
+    item.dataset.status = task.status || "pending";
+    const createdAt = new Date(Number(task.createdAt) || Date.now());
+    item.innerHTML = `
+      <div class="ai-task-item-top">
+        <span class="ai-task-item-title">${escapeHtml(aiTaskKindLabel(task.kind))}</span>
+        <span class="ai-task-status">${escapeHtml(aiTaskStatusLabel(task.status))}</span>
+      </div>
+      <div class="ai-task-item-excerpt">${escapeHtml(aiTaskExcerpt(task))}</div>
+      <div class="ai-task-item-meta">
+        <span>${escapeHtml(task.request?.videoTitle || t("unknown"))}</span>
+        <span>${escapeHtml(createdAt.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }))}</span>
+      </div>
+    `;
+    if (interactive) {
+      item.addEventListener("click", () => {
+        document.getElementById("aiTasksOverlay")?.setAttribute("hidden", "");
+        openContextQuestion(task.request, task);
+      });
+    }
+    list.appendChild(item);
+  });
+}
+
+async function refreshAiTask(taskId) {
+  const response = await chrome.runtime.sendMessage({
+    action: "refreshAiTask",
+    taskId,
+  });
+  if (!response?.success) {
+    throw new Error(response?.error || t("aiTaskRefreshFailed"));
+  }
+  const index = aiTaskCenterTasks.findIndex((task) => task.id === taskId);
+  if (index >= 0) aiTaskCenterTasks[index] = response.task;
+  else aiTaskCenterTasks.unshift(response.task);
+  renderAiTaskCenter();
+  return response.task;
+}
+
+async function waitForAiTask(taskId, isActive = () => true) {
+  while (isActive()) {
+    const task = await refreshAiTask(taskId);
+    if (isAiTaskTerminal(task)) return task;
+    await new Promise((resolve) => setTimeout(resolve, AI_TASK_POLL_INTERVAL_MS));
+  }
+  return null;
+}
+
+async function applyCompletedTranslationTasks(tasks = aiTaskCenterTasks) {
+  if (!currentContentKey || !currentTranscript?.length) return;
+  const segments = getActiveTranscriptSegments();
+  const segmentById = new Map(segments.map((segment) => [segment.id, segment]));
+  let changed = false;
+  tasks
+    .filter(
+      (task) =>
+        task.kind === "translation" &&
+        task.status === "completed" &&
+        task.request?.contentKey === currentContentKey,
+    )
+    .forEach((task) => {
+      (task.result?.translatedContent?.segments || []).forEach((translated) => {
+        const segment = segmentById.get(translated.id);
+        if (!segment || !translated.text) return;
+        const key = transcriptTranslationCacheKey(segment);
+        if (transcriptParagraphCache.get(key) === translated.text) return;
+        transcriptParagraphCache.set(key, translated.text);
+        changed = true;
+      });
+    });
+  if (!changed) return;
+  if (currentTranscriptMode !== "original") renderTranscript();
+  await updateCache();
+}
+
+function scheduleAiTaskCenterPoll() {
+  clearTimeout(aiTaskCenterPollTimer);
+  if (!aiTaskCenterTasks.some((task) => !isAiTaskTerminal(task))) return;
+  aiTaskCenterPollTimer = setTimeout(async () => {
+    await refreshAiTaskCenter({ refreshPending: true }).catch(() => {});
+  }, 2200);
+}
+
+async function refreshAiTaskCenter({ refreshPending = false } = {}) {
+  const response = await chrome.runtime.sendMessage({ action: "listAiTasks" });
+  if (!response?.success) return;
+  aiTaskCenterTasks = response.tasks || [];
+  if (refreshPending) {
+    const pending = aiTaskCenterTasks.filter((task) => !isAiTaskTerminal(task));
+    for (const task of pending) {
+      await refreshAiTask(task.id).catch(() => {});
+    }
+  }
+  renderAiTaskCenter();
+  await applyCompletedTranslationTasks();
+  scheduleAiTaskCenterPoll();
+}
 
 function cancelTranslationInBackground(requestId) {
   try {
@@ -348,6 +493,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   await initializeInterfaceLanguage();
   setupEventListeners();
   await evictOldCacheEntries(20);
+  await refreshAiTaskCenter({ refreshPending: true }).catch(() => {});
 
   const configStatus = await chrome.runtime.sendMessage({
     action: "checkConfig",
@@ -359,6 +505,7 @@ document.addEventListener("DOMContentLoaded", async () => {
   }
 
   await checkCurrentTab();
+  await refreshAiTaskCenter({ refreshPending: true }).catch(() => {});
 });
 
 // Listen for messages from the Digest button on YouTube page
@@ -488,6 +635,19 @@ function setupEventListeners() {
 
   document.getElementById("settingsBtn")?.addEventListener("click", () => {
     chrome.runtime.sendMessage({ action: "openOptions" });
+  });
+
+  document.getElementById("aiTasksBtn")?.addEventListener("click", async () => {
+    document.getElementById("aiTasksOverlay")?.removeAttribute("hidden");
+    await refreshAiTaskCenter({ refreshPending: true }).catch(() => {});
+  });
+  document.getElementById("aiTasksCloseBtn")?.addEventListener("click", () => {
+    document.getElementById("aiTasksOverlay")?.setAttribute("hidden", "");
+  });
+  document.getElementById("aiTasksOverlay")?.addEventListener("click", (event) => {
+    if (event.target === event.currentTarget) {
+      event.currentTarget.setAttribute("hidden", "");
+    }
   });
 
   // Transcript actions
@@ -737,6 +897,7 @@ async function startDigest(videoId, videoUrl, source = null) {
 
     // Setup explain feature
     setupExplainFeature();
+    await applyCompletedTranslationTasks();
     return;
   }
 
@@ -834,6 +995,7 @@ async function startDigest(videoId, videoUrl, source = null) {
   setupExplainFeature();
   // Save transcript to cache (without analysis)
   await saveToCache(videoId);
+  await applyCompletedTranslationTasks();
 
   // Translation and overview generation require an explicit button click.
 }
@@ -1515,11 +1677,11 @@ function attachContextAskButton(container, context) {
   });
 }
 
-function openContextQuestion(context) {
+function openContextQuestion(context, existingTask = null) {
   context = {
     ...context,
-    platform: currentPlatform,
-    pageNumber: currentPageNumber,
+    platform: context.platform || currentPlatform,
+    pageNumber: context.pageNumber || currentPageNumber,
   };
   document.getElementById("contextQuestionModal")?.remove();
   const timestamp = YTD_QUESTION_ANSWER.formatTimestamp(
@@ -1569,8 +1731,61 @@ function openContextQuestion(context) {
   const resultBox = modal.querySelector(".context-question-result");
   const answerBox = modal.querySelector(".context-question-answer");
   const saveButton = modal.querySelector(".context-question-save");
-  let latestRequest = null;
-  let latestAnswer = "";
+  let latestRequest = existingTask?.request || null;
+  let latestAnswer = existingTask?.result?.answer || "";
+
+  const showPending = () => {
+    resultBox.hidden = false;
+    saveButton.hidden = true;
+    answerBox.innerHTML = `
+      <div class="explain-loading">
+        <div class="loading-bar"></div>
+        <span>${escapeHtml(t("readingContext"))}</span>
+      </div>
+    `;
+  };
+
+  const showTask = (task) => {
+    if (!task) return;
+    latestRequest = task.request || latestRequest;
+    resultBox.hidden = false;
+    if (task.status === "completed" && task.result?.answer) {
+      latestAnswer = task.result.answer;
+      answerBox.innerHTML = `<div class="context-question-answer-text">${escapeHtml(latestAnswer).replace(/\n/g, "<br>")}</div>`;
+      saveButton.hidden = false;
+      return;
+    }
+    if (task.status === "failed") {
+      answerBox.innerHTML = `<div class="explain-error">${escapeHtml(task.error || t("codexCouldNotAnswer"))}</div>`;
+      saveButton.hidden = true;
+      return;
+    }
+    showPending();
+  };
+
+  if (existingTask) {
+    input.value = existingTask.request?.question || "";
+    showTask(existingTask);
+    if (!isAiTaskTerminal(existingTask)) {
+      submit.disabled = true;
+      submit.textContent = t("askingCodex");
+      waitForAiTask(existingTask.id, () => document.body.contains(modal))
+        .then((task) => {
+          if (task && document.body.contains(modal)) showTask(task);
+        })
+        .catch((error) => {
+          if (document.body.contains(modal)) {
+            answerBox.innerHTML = `<div class="explain-error">${escapeHtml(error.message)}</div>`;
+          }
+        })
+        .finally(() => {
+          if (document.body.contains(modal)) {
+            submit.disabled = false;
+            submit.textContent = t("askCodex");
+          }
+        });
+    }
+  }
 
   form.addEventListener("submit", async (event) => {
     event.preventDefault();
@@ -1580,28 +1795,27 @@ function openContextQuestion(context) {
     latestAnswer = "";
     submit.disabled = true;
     submit.textContent = t("askingCodex");
-    resultBox.hidden = false;
     saveButton.disabled = false;
     saveButton.hidden = true;
     saveButton.textContent = `＋ ${t("saveAnswerToNotes")}`;
-    answerBox.innerHTML = `
-      <div class="explain-loading">
-        <div class="loading-bar"></div>
-        <span>${escapeHtml(t("readingContext"))}</span>
-      </div>
-    `;
+    showPending();
 
     try {
       const response = await chrome.runtime.sendMessage({
-        action: "askContextQuestion",
+        action: "startContextQuestionTask",
         request: latestRequest,
       });
       if (!response?.success) {
         throw new Error(response?.error || t("codexCouldNotAnswer"));
       }
-      latestAnswer = response.answer;
-      answerBox.innerHTML = `<div class="context-question-answer-text">${escapeHtml(latestAnswer).replace(/\n/g, "<br>")}</div>`;
-      saveButton.hidden = false;
+      aiTaskCenterTasks.unshift(response.task);
+      renderAiTaskCenter();
+      scheduleAiTaskCenterPoll();
+      const task = await waitForAiTask(
+        response.task.id,
+        () => document.body.contains(modal),
+      );
+      if (task && document.body.contains(modal)) showTask(task);
     } catch (error) {
       answerBox.innerHTML = `<div class="explain-error">${escapeHtml(error.message)}</div>`;
     } finally {
@@ -2630,20 +2844,34 @@ async function requestTranscriptTranslationBatch(
   mode,
 ) {
   const sourceBatch = indices.map((index) => segments[index]);
-  const requestId = crypto.randomUUID();
-  activeTranslationRequestIds.add(requestId);
   setTranslatingSpinner(true);
   try {
-    const result = await sendTranslationMessage({
-      action: "translateContent",
-      requestId,
-      content: {
-        segments: sourceBatch.map(({ id, text }) => ({ id, text })),
+    const started = await chrome.runtime.sendMessage({
+      action: "startTranslationTask",
+      request: {
+        content: {
+          segments: sourceBatch.map(({ id, text }) => ({ id, text })),
+        },
+        contentType: "transcriptBatch",
+        targetLanguage: "zh",
+        videoTitle: currentVideoTitle,
+        platform: currentPlatform,
+        videoId: currentVideoId,
+        pageNumber: currentPageNumber,
+        contentKey: currentContentKey,
       },
-      contentType: "transcriptBatch",
-      targetLanguage: "zh",
-      videoTitle: currentVideoTitle,
     });
+    if (!started?.success || !started.task) {
+      throw new Error(started?.error || t("translationFailed"));
+    }
+    aiTaskCenterTasks.unshift(started.task);
+    renderAiTaskCenter();
+    scheduleAiTaskCenterPoll();
+    const task = await waitForAiTask(
+      started.task.id,
+      () => generation === translationGeneration,
+    );
+    if (!task) return;
 
     const isStale =
       generation !== translationGeneration ||
@@ -2651,13 +2879,13 @@ async function requestTranscriptTranslationBatch(
       mode !== currentTranscriptMode;
     if (isStale) return;
 
-    const responseSegments = result?.success
-      ? result.translatedContent?.segments
+    const responseSegments = task.status === "completed"
+      ? task.result?.translatedContent?.segments
       : [];
     const aligned = alignTranslatedSegmentBatch(sourceBatch, responseSegments);
     aligned.forEach((item, batchIndex) => {
-      if (!result?.success) {
-        item.error = result?.error || t("translationFailed");
+      if (task.status !== "completed") {
+        item.error = task.error || t("translationFailed");
       }
       updateTranslatedRow(
         sourceBatch[batchIndex],
@@ -2678,7 +2906,6 @@ async function requestTranscriptTranslationBatch(
       );
     });
   } finally {
-    activeTranslationRequestIds.delete(requestId);
     if (generation === translationGeneration) setTranslatingSpinner(false);
   }
 }
@@ -2724,8 +2951,13 @@ function createTranslationQueue(segments) {
     const first = queue.shift();
     const indices = [first.index];
     if (!first.individual) {
-      while (queue.length && !queue[0].individual && indices.length < 12) {
+      let characters = segments[first.index].text.length;
+      while (queue.length && !queue[0].individual && indices.length < 40) {
+        const nextIndex = queue[0].index;
+        const nextCharacters = segments[nextIndex].text.length;
+        if (characters + nextCharacters > 8000) break;
         indices.push(queue.shift().index);
+        characters += nextCharacters;
       }
     }
     indices.forEach((index) => {

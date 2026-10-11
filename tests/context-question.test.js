@@ -90,7 +90,9 @@ test("all three side-panel sources expose Ask and save-to-Notes actions", () => 
   assert.match(panel, /sourceLabel: t\("sourceOverviewChapter"\)/);
   assert.match(panel, /sourceLabel: t\("sourceOverviewQuote"\)/);
   assert.match(panel, /sourceLabel: t\("sourceSavedNote"\)/);
-  assert.match(panel, /action: "askContextQuestion"/);
+  assert.match(panel, /action: "startContextQuestionTask"/);
+  assert.match(panel, /action: "refreshAiTask"/);
+  assert.match(panel, /id="aiTasksBtn"|aiTasksBtn/);
   assert.match(panel, /action: "saveQuestionAnswerNote"/);
   assert.match(background, /handleContextQuestion/);
   assert.match(background, /handleSaveQuestionAnswerNote/);

@@ -19,6 +19,18 @@
         </div>
         <div class="header-actions">
           <button
+            class="tasks-btn"
+            id="aiTasksBtn"
+            type="button"
+            title="Open AI tasks"
+            aria-label="Open AI tasks"
+            data-i18n-title="aiTasksTitle"
+            data-i18n-aria-label="aiTasksTitle"
+          >
+            <span data-i18n="aiTasks">AI Tasks</span>
+            <span class="tasks-badge" id="aiTasksBadge" hidden>0</span>
+          </button>
+          <button
             class="language-btn"
             id="languageBtn"
             type="button"
@@ -312,6 +324,20 @@
           </form>
         </div>
       </div>
+    </div>
+
+    <div class="ai-tasks-overlay" id="aiTasksOverlay" hidden>
+      <section class="ai-tasks-drawer" role="dialog" aria-modal="true" aria-labelledby="aiTasksHeading">
+        <div class="ai-tasks-header">
+          <div>
+            <div class="context-question-eyebrow" data-i18n="aiTasksEyebrow">LOCAL AI</div>
+            <h2 id="aiTasksHeading" data-i18n="aiTasks">AI Tasks</h2>
+          </div>
+          <button class="context-question-close" id="aiTasksCloseBtn" type="button" data-i18n-aria-label="close" aria-label="Close">✕</button>
+        </div>
+        <p class="ai-tasks-help" data-i18n="aiTasksHelp">Tasks keep running when you switch pages. Open a completed question to view or save its answer.</p>
+        <div class="ai-tasks-list" id="aiTasksList"></div>
+      </section>
     </div>
 
     <!-- Auto-scroll follow button — appears when user scrolls away from playback position -->

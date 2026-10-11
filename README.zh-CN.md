@@ -14,6 +14,7 @@ Video Digest 是一个本地优先的 Chrome 扩展：把带字幕的 YouTube �
 - 打开后直接查看原文字幕；按需翻译单条或整篇字幕，再切换简体中文或双语视图。
 - 使用 Codex 或 TraeWork 生成章节、重点引用、解释、翻译与润色笔记。
 - 针对任意字幕片段、Overview 内容或已有 Note 直接提问，并可把任一服务的回答保存回 Notes。
+- 提问或翻译进行中可以切换页面，之后从「AI 任务」重新打开并取回结果。
 - 保存时间戳笔记，并跳回视频对应位置。
 - 在 Create 页面组合视频来源、概览、笔记与个人反思。
 - 把严格限定内容的 Learning Pack 发送到可配置的本地 Creator Workspace。
@@ -45,7 +46,7 @@ Video Digest 是一个本地优先的 Chrome 扩展：把带字幕的 YouTube �
 
 - Google Chrome 116 或更高版本
 - Node.js 18 或更高版本
-- 至少一个已登录的本地 AI 服务：[Codex CLI](https://developers.openai.com/codex/cli) 或 [Trae CLI 2.0](https://docs.trae.cn/cli_get-started-with-trae-code-cli-2)
+- 至少一个已登录的本地 AI 服务：[Codex CLI](https://developers.openai.com/codex/cli) 0.162.1 或更高版本，或 [Trae CLI 2.0](https://docs.trae.cn/cli_get-started-with-trae-code-cli-2)
 - 一个提供字幕的 YouTube 或哔哩哔哩视频
 
 ## 安装
@@ -116,9 +117,10 @@ Learning Pack 可以包含：
 3. 打开「概览」并点击「生成概览」，才会提取章节与重点引用。
 4. 选中字幕获取解释。
 5. 在字幕片段、章节、重点引用或 Note 上点击 **Ask**。Codex 与 TraeWork 都会在插件内回答。
-6. 将有价值的回答保存到 **Notes**，同时保留来源和时间戳。
-7. 从播放器或重点引用保存时间戳笔记。
-8. 打开 **Create**，补充个人反思，再发送 Learning Pack。
+6. 提问或翻译过程中可以切换页面；之后从「AI 任务」恢复任务和结果。
+7. 将有价值的回答保存到 **Notes**，同时保留来源和时间戳。
+8. 从播放器或重点引用保存时间戳笔记。
+9. 打开 **Create**，补充个人反思，再发送 Learning Pack。
 
 ## 隐私与安全
 

@@ -161,7 +161,7 @@ test("background validates translation batch size and stable IDs", () => {
   const { validateTranscriptBatchRequest } = loadBackgroundHelpers();
   assert.throws(
     () => validateTranscriptBatchRequest({ segments: [] }),
-    /1 to 12 segments/,
+    /1 to 40 segments/,
   );
   assert.throws(
     () =>
@@ -190,6 +190,7 @@ test("AI requests send the selected provider through the authenticated local bri
   const result = await helpers.requestAiCompletion({
     maxTokens: 128,
     responseFormat: { type: "json_object" },
+    taskType: "default",
     messages: [{ role: "user", content: "Hello." }],
   });
 
@@ -204,6 +205,7 @@ test("AI requests send the selected provider through the authenticated local bri
     messages: [{ role: "user", content: "Hello." }],
     maxTokens: 128,
     responseFormat: { type: "json_object" },
+    taskType: "default",
   });
 });
 
@@ -337,14 +339,48 @@ test("overview analysis runs after the explicit generation action", async () => 
 
 test("translation starts only when enqueued and single lines remain serial", async () => {
   const sent = [];
-  const pending = [];
+  let taskNumber = 0;
+  const tasks = new Map();
   const helpers = loadSidepanelHelpers({
-    sendMessage: (message) => {
+    sendMessage: async (message) => {
       sent.push(message);
-      return new Promise((resolve) => pending.push(resolve));
+      if (message.action === "startTranslationTask") {
+        const id = `task-${++taskNumber}`;
+        const segments = message.request.content.segments;
+        const task = {
+          id,
+          kind: "translation",
+          status: "running",
+          createdAt: Date.now(),
+          updatedAt: Date.now(),
+          request: { segments },
+        };
+        tasks.set(id, task);
+        return { success: true, task };
+      }
+      if (message.action === "refreshAiTask") {
+        const task = tasks.get(message.taskId);
+        return {
+          success: true,
+          task: {
+            ...task,
+            status: "completed",
+            result: {
+              translatedContent: {
+                segments: task.request.segments.map((segment) => ({
+                  id: segment.id,
+                  text: `中文 ${segment.id}`,
+                  error: "",
+                })),
+              },
+            },
+          },
+        };
+      }
+      return { success: true };
     },
   });
-  const segments = Array.from({ length: 13 }, (_, index) => ({
+  const segments = Array.from({ length: 41 }, (_, index) => ({
     id: `segment-${index}`,
     text: `Sentence ${index}.`,
     start: index,
@@ -355,25 +391,20 @@ test("translation starts only when enqueued and single lines remain serial", asy
 
   helpers.evaluate('activeTranslationQueue.enqueue(0, true, true); activeTranslationQueue.enqueue(1, true, true)');
   await new Promise(setImmediate);
-  assert.equal(sent.length, 1);
-  assert.equal(sent[0].content.segments.length, 1);
-  pending.shift()({ success: false, error: "test failure" });
   await new Promise(setImmediate);
-  assert.equal(sent.length, 2);
-  assert.equal(sent[1].content.segments.length, 1);
-  pending.shift()({ success: false, error: "test failure" });
-  await new Promise(setImmediate);
+  const firstStarts = sent.filter((message) => message.action === "startTranslationTask");
+  assert.equal(firstStarts.length, 2);
+  assert.equal(firstStarts[0].request.content.segments.length, 1);
+  assert.equal(firstStarts[1].request.content.segments.length, 1);
 
   helpers.evaluate('activeTranslationQueue.enqueueAll()');
   await new Promise(setImmediate);
-  assert.equal(sent.length, 3);
-  assert.equal(sent[2].content.segments.length, 12);
-  pending.shift()({ success: false, error: "test failure" });
   await new Promise(setImmediate);
-  assert.equal(sent.length, 4);
-  assert.equal(sent[3].content.segments.length, 1);
-  pending.shift()({ success: false, error: "test failure" });
   await new Promise(setImmediate);
+  const allStarts = sent.filter((message) => message.action === "startTranslationTask");
+  assert.equal(allStarts.length, 4);
+  assert.equal(allStarts[2].request.content.segments.length, 40);
+  assert.equal(allStarts[3].request.content.segments.length, 1);
 });
 
 test("manual controls are the only overview and transcript generation entry points", () => {
